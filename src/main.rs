@@ -5,7 +5,7 @@ use octocrab::Octocrab;
 use regex::Regex;
 use std::process::Command;
 use std::env;
-use git_releasenotes::{process_commit, generate_release_notes, ProcessedCommit};
+use git_releasenotes::{process_commit_with_pr, generate_release_notes, ProcessedCommit};
 use gix;
 
 #[derive(Parser, Debug)]
@@ -237,6 +237,106 @@ async fn main() -> Result<()> {
         (String::new(), String::new())
     };
 
+    // Build a map of commit OID -> PR number by scanning merge commits
+    // This helps us find PR numbers for commits that were merged via PRs
+    // We need to scan a wider range to find merge commits that reference commits in our range
+    use std::collections::HashMap;
+    let mut commit_to_pr: HashMap<gix::ObjectId, u64> = HashMap::new();
+    let re_merge_pr = Regex::new(r"Merge pull request #([0-9]+)").unwrap();
+    
+    // First, scan commits in our range for merge commits
+    for oid in &commit_ids {
+        let obj = repo.find_object(*oid)?;
+        let commit = obj.into_commit();
+        let msg = commit.message()?;
+        let subject = msg.summary().to_string();
+        
+        // Check if this is a merge commit with a PR number
+        if let Some(caps) = re_merge_pr.captures(&subject) {
+            if let Some(m) = caps.get(1) {
+                if let Ok(pr_num) = m.as_str().parse::<u64>() {
+                    // This merge commit has a PR number
+                    // Find all parent commits (excluding the first parent which is usually main/master)
+                    let parents = commit.parent_ids();
+                    for parent_id in parents.skip(1) {
+                        // Map the merged commit to this PR number
+                        commit_to_pr.insert(parent_id.into(), pr_num);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Also scan merge commits that are ancestors of commits in our range
+    // This catches merge commits that might be just outside our range but still relevant
+    let mut seen_commits = std::collections::HashSet::new();
+    for oid in &commit_ids {
+        seen_commits.insert(*oid);
+    }
+    
+    // Walk backwards from each commit to find merge commits
+    // This helps find PR numbers for commits that were merged but the merge commit
+    // might be outside our immediate range
+    for oid in &commit_ids {
+        let mut current = Some(*oid);
+        let mut depth = 0;
+        // Limit depth to avoid going too far back
+        while depth < 5 {
+            let curr_oid = match current {
+                Some(oid) => oid,
+                None => break,
+            };
+            depth += 1;
+            let obj = match repo.find_object(curr_oid) {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            let commit = obj.into_commit();
+            let parents = commit.parent_ids().collect::<Vec<_>>();
+            
+            // Check if any parent is a merge commit we haven't seen
+            for parent_id in &parents {
+                let parent_oid: gix::ObjectId = (*parent_id).into();
+                if seen_commits.contains(&parent_oid) {
+                    continue;
+                }
+                seen_commits.insert(parent_oid);
+                
+                let parent_obj = match repo.find_object(parent_oid) {
+                    Ok(o) => o,
+                    Err(_) => continue,
+                };
+                let parent_commit = parent_obj.into_commit();
+                let parent_msg = match parent_commit.message() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let parent_subject = parent_msg.summary().to_string();
+                
+                // Check if this parent is a merge commit with a PR number
+                if let Some(caps) = re_merge_pr.captures(&parent_subject) {
+                    if let Some(m) = caps.get(1) {
+                        if let Ok(pr_num) = m.as_str().parse::<u64>() {
+                            // This merge commit references curr_oid (or one of its ancestors)
+                            // Map curr_oid to this PR number
+                            commit_to_pr.insert(curr_oid, pr_num);
+                            // Found PR, stop searching for this commit
+                            current = None;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // Move to first parent for next iteration (if we haven't found a PR)
+            if current.is_some() {
+                current = parents.first().map(|p| (*p).into());
+            } else {
+                break; // Found PR, stop searching
+            }
+        }
+    }
+
     let mut dependabot_updates = Vec::new();
     let mut other_changes = Vec::new();
 
@@ -248,8 +348,11 @@ async fn main() -> Result<()> {
         let body = msg.body().map(|b| b.to_string()).unwrap_or_default();
         let author = commit.author()?.name.to_string();
         let hash = oid.to_string();
+        
+        // Check if we found a PR number for this commit from merge commits
+        let pr_from_merge = commit_to_pr.get(&oid).copied();
 
-        let result = process_commit(&subject, &body, &hash, &author, args.include_pr_numbers, &octocrab, &owner, &repo_name).await;
+        let result = process_commit_with_pr(&subject, &body, &hash, &author, args.include_pr_numbers, pr_from_merge, &octocrab, &owner, &repo_name).await;
         if let Some(res) = result {
             match res {
                 ProcessedCommit::Dependabot(lines) => dependabot_updates.extend(lines),
