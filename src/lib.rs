@@ -123,6 +123,9 @@ pub async fn process_commit(
 
 pub fn consolidate_dependabot_updates(updates: Vec<String>) -> Vec<String> {
     let re_update = Regex::new(r"Updates `([^`]+)` from ([^ ]+) to ([^ ]+)").unwrap();
+    let re_bump_link = Regex::new(r"Bumps? \[([^\]]+)\]\([^\)]+\) from ([^ ]+) to ([^ ]+)").unwrap();
+    let re_bump_simple = Regex::new(r"Bumps? ([^ ]+) from ([^ ]+) to ([^ ]+)").unwrap();
+    
     let mut package_updates: HashMap<String, (String, String)> = HashMap::new();
     let mut other_updates: Vec<String> = Vec::new();
 
@@ -154,11 +157,23 @@ pub fn consolidate_dependabot_updates(updates: Vec<String>) -> Vec<String> {
     // Let's assume that.
     
     for line in updates {
-        if let Some(caps) = re_update.captures(&line) {
-            let pkg = caps.get(1).unwrap().as_str().to_string();
-            let from = caps.get(2).unwrap().as_str().to_string();
-            let to = caps.get(3).unwrap().as_str().to_string();
+        let parsed = if let Some(caps) = re_update.captures(&line) {
+             Some((caps.get(1).unwrap().as_str().to_string(),
+                   caps.get(2).unwrap().as_str().to_string(),
+                   caps.get(3).unwrap().as_str().to_string()))
+        } else if let Some(caps) = re_bump_link.captures(&line) {
+             Some((caps.get(1).unwrap().as_str().to_string(),
+                   caps.get(2).unwrap().as_str().to_string(),
+                   caps.get(3).unwrap().as_str().to_string()))
+        } else if let Some(caps) = re_bump_simple.captures(&line) {
+             Some((caps.get(1).unwrap().as_str().to_string(),
+                   caps.get(2).unwrap().as_str().to_string(),
+                   caps.get(3).unwrap().as_str().to_string()))
+        } else {
+            None
+        };
 
+        if let Some((pkg, from, to)) = parsed {
             if let Some((existing_from, existing_to)) = package_updates.get_mut(&pkg) {
                  // Try to chain
                  if &to == existing_from {
@@ -197,6 +212,64 @@ pub fn consolidate_dependabot_updates(updates: Vec<String>) -> Vec<String> {
     final_lines.extend(other_updates);
     
     final_lines
+}
+
+pub fn generate_release_notes(
+    mut dependabot_updates: Vec<String>,
+    mut other_changes: Vec<String>,
+) -> String {
+    let mut final_output_lines = Vec::new();
+
+    if !dependabot_updates.is_empty() {
+        // Consolidate updates
+        dependabot_updates = consolidate_dependabot_updates(dependabot_updates);
+
+        // Check for major version changes
+        let re_update = Regex::new(r"Updates `([^`]+)` from ([^ ]+) to ([^ ]+)").unwrap();
+        let mut major_changes = Vec::new();
+
+        for line in &dependabot_updates {
+            if let Some(caps) = re_update.captures(line) {
+                let pkg = caps.get(1).unwrap().as_str();
+                let from = caps.get(2).unwrap().as_str();
+                let to = caps.get(3).unwrap().as_str();
+
+                // Simple major version check (first component changed)
+                let from_major = from.split('.').next().unwrap_or("0");
+                let to_major = to.split('.').next().unwrap_or("0");
+
+                if let (Ok(f), Ok(t)) = (from_major.parse::<u32>(), to_major.parse::<u32>()) {
+                    if t > f {
+                        major_changes.push(format!("{}: {} → {}", pkg, from, to));
+                    }
+                }
+            }
+        }
+
+        if !major_changes.is_empty() {
+            major_changes.sort();
+            final_output_lines.push(format!(
+                "⚠ WARNING: Major version changes detected: {}",
+                major_changes.join(", ")
+            ));
+            final_output_lines.push("".to_string());
+        }
+
+        final_output_lines.push("## Dependencies updated by dependabot:".to_string());
+        final_output_lines.push("".to_string());
+        dependabot_updates.sort();
+        final_output_lines.extend(dependabot_updates);
+        final_output_lines.push("".to_string());
+    }
+
+    if !other_changes.is_empty() {
+        other_changes.sort();
+        other_changes.dedup();
+        final_output_lines.push("## Other changes:".to_string());
+        final_output_lines.extend(other_changes);
+    }
+
+    final_output_lines.join("\n")
 }
 
 #[cfg(test)]
@@ -282,5 +355,75 @@ mod tests {
             "- Updates `lib` from 1.2.3 to 1.3.0".to_string(),
         ];
         assert_eq!(res, expected);
+    }
+
+    #[test]
+    fn test_consolidate_mixed_formats() {
+        let updates = vec![
+            "- Updates `lib` from 1.2.4 to 1.3.0".to_string(),
+            "- Bumps [lib](https://github.com/lib/lib) from 1.2.3 to 1.2.4".to_string(), 
+        ];
+        
+        let mut res = consolidate_dependabot_updates(updates);
+        res.sort();
+        
+        let expected = vec![
+            "- Updates `lib` from 1.2.3 to 1.3.0".to_string(),
+        ];
+        assert_eq!(res, expected);
+    }
+
+    #[test]
+    fn test_generate_release_notes_empty() {
+        let output = generate_release_notes(vec![], vec![]);
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn test_generate_release_notes_dependabot_only() {
+        let updates = vec![
+            "- Updates `lib` from 1.0.0 to 1.1.0".to_string(),
+        ];
+        let output = generate_release_notes(updates, vec![]);
+        assert!(output.contains("## Dependencies updated by dependabot:"));
+        assert!(output.contains("- Updates `lib` from 1.0.0 to 1.1.0"));
+        assert!(!output.contains("## Other changes:"));
+        assert!(!output.contains("Major version changes detected"));
+    }
+
+    #[test]
+    fn test_generate_release_notes_other_only() {
+        let other = vec![
+            "- Fix something".to_string(),
+            "- Add something".to_string(),
+        ];
+        let output = generate_release_notes(vec![], other);
+        assert!(!output.contains("## Dependencies updated by dependabot:"));
+        assert!(output.contains("## Other changes:"));
+        assert!(output.contains("- Fix something"));
+        assert!(output.contains("- Add something"));
+    }
+
+    #[test]
+    fn test_generate_release_notes_major_version_warning() {
+        let updates = vec![
+            "- Updates `lib` from 1.0.0 to 2.0.0".to_string(),
+        ];
+        let output = generate_release_notes(updates, vec![]);
+        assert!(output.contains("WARNING: Major version changes detected: lib: 1.0.0 → 2.0.0"));
+    }
+
+    #[test]
+    fn test_generate_release_notes_sorting_and_deduplication() {
+        let other = vec![
+            "- B change".to_string(),
+            "- A change".to_string(),
+            "- A change".to_string(),
+        ];
+        let output = generate_release_notes(vec![], other);
+        let lines: Vec<&str> = output.lines().collect();
+        // Skip header "## Other changes:"
+        let content_lines: Vec<&str> = lines.into_iter().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(content_lines, vec!["- A change", "- B change"]);
     }
 }

@@ -5,7 +5,7 @@ use octocrab::Octocrab;
 use regex::Regex;
 use std::process::Command;
 use std::env;
-use git_releasenotes::{process_commit, consolidate_dependabot_updates, ProcessedCommit};
+use git_releasenotes::{process_commit, generate_release_notes, ProcessedCommit};
 use gix;
 
 #[derive(Parser, Debug)]
@@ -259,53 +259,8 @@ async fn main() -> Result<()> {
     }
 
     // Print output
-    let mut final_output_lines = Vec::new();
+    let full_output = generate_release_notes(dependabot_updates, other_changes);
     
-    if !dependabot_updates.is_empty() {
-        // Consolidate updates
-        dependabot_updates = consolidate_dependabot_updates(dependabot_updates);
-
-        // Check for major version changes
-        let re_update = Regex::new(r"Updates `([^`]+)` from ([^ ]+) to ([^ ]+)").unwrap();
-        let mut major_changes = Vec::new();
-        
-        for line in &dependabot_updates {
-            if let Some(caps) = re_update.captures(line) {
-                let pkg = caps.get(1).unwrap().as_str();
-                let from = caps.get(2).unwrap().as_str();
-                let to = caps.get(3).unwrap().as_str();
-                
-                // Simple major version check (first component changed)
-                let from_major = from.split('.').next().unwrap_or("0");
-                let to_major = to.split('.').next().unwrap_or("0");
-                
-                if let (Ok(f), Ok(t)) = (from_major.parse::<u32>(), to_major.parse::<u32>()) {
-                    if t > f {
-                        major_changes.push(format!("{}: {} → {}", pkg, from, to));
-                    }
-                }
-            }
-        }
-        
-        if !major_changes.is_empty() {
-            major_changes.sort();
-            final_output_lines.push(format!("⚠ WARNING: Major version changes detected: {}", major_changes.join(", ")));
-            final_output_lines.push("".to_string());
-        }
-
-        final_output_lines.push("## Dependencies updated by dependabot:".to_string());
-        final_output_lines.push("".to_string());
-        dependabot_updates.sort();
-        final_output_lines.extend(dependabot_updates);
-        final_output_lines.push("".to_string());
-    }
-    
-    if !other_changes.is_empty() {
-        final_output_lines.push("## Other changes:".to_string());
-        final_output_lines.extend(other_changes);
-    }
-
-    let full_output = final_output_lines.join("\n");
     if !full_output.is_empty() {
         println!("{}", full_output);
     }
