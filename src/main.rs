@@ -1,12 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use arboard::Clipboard;
 use clap::Parser;
+use git_releasenotes::{generate_release_notes, process_commit_with_pr, ProcessedCommit};
 use octocrab::Octocrab;
 use regex::Regex;
-use std::process::Command;
 use std::env;
-use git_releasenotes::{process_commit_with_pr, generate_release_notes, ProcessedCommit};
-use gix;
+use std::process::Command;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -69,11 +68,10 @@ async fn main() -> Result<()> {
     dotenv::dotenv().ok();
 
     let args = Args::parse();
-    
+
     // Open repo
-    let repo = gix::discover(".")
-        .context("Failed to discover git repository")?;
-        
+    let repo = gix::discover(".").context("Failed to discover git repository")?;
+
     // Check if git CLI is available (for fetch/pull which are complex in gix)
     if Command::new("git").arg("--version").output().is_err() {
         return Err(anyhow!("Error: git is not installed or not in PATH"));
@@ -83,12 +81,12 @@ async fn main() -> Result<()> {
         // Check for local changes
         // Using git CLI for diff check as it's robust for 'dirty' check
         let diff_exit = Command::new("git")
-            .args(&["diff", "--quiet"])
+            .args(["diff", "--quiet"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
         let diff_cached_exit = Command::new("git")
-            .args(&["diff", "--cached", "--quiet"])
+            .args(["diff", "--cached", "--quiet"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -109,9 +107,14 @@ async fn main() -> Result<()> {
     let main_branch = "main";
     // Get current branch
     let head_ref = repo.head()?;
-    let current_branch = head_ref.referent_name().map(|n| n.as_bstr().to_string()).unwrap_or_default();
+    let current_branch = head_ref
+        .referent_name()
+        .map(|n| n.as_bstr().to_string())
+        .unwrap_or_default();
     // referent_name gives refs/heads/main, typically we want short name
-    let current_branch_short = current_branch.strip_prefix("refs/heads/").unwrap_or(&current_branch);
+    let current_branch_short = current_branch
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&current_branch);
 
     if current_branch_short != main_branch {
         if args.terse {
@@ -126,32 +129,38 @@ async fn main() -> Result<()> {
     } else {
         run_git(&["pull", "--ff-only", "origin", main_branch])?;
     }
-    
-    // Re-discover repo after pull/checkout potentially changed things? 
+
+    // Re-discover repo after pull/checkout potentially changed things?
     // Usually safe to keep using 'repo' handle, but head might have moved.
-    let repo = gix::discover(".")?; 
+    let repo = gix::discover(".")?;
 
     let from_ref_oid = if let Some(commit_sha) = &args.commit {
         let obj = repo.rev_parse_single(commit_sha.as_str())?;
         obj
     } else if let Some(tag_name) = &args.tag {
         let tag_ref_name = format!("refs/tags/{}", tag_name);
-        let tag_ref = repo.find_reference(&tag_ref_name)
+        let tag_ref = repo
+            .find_reference(&tag_ref_name)
             .map_err(|_| anyhow!("Error: '{}' exists but is not a tag", tag_name))?;
-        tag_ref.into_fully_peeled_id().context("Failed to peel tag")?
+        tag_ref
+            .into_fully_peeled_id()
+            .context("Failed to peel tag")?
     } else {
-         // Find latest tag
-         // gix doesn't have a direct "describe --tags" equivalent built-in simply yet
-         // We can iterate tags and find the one reachable from HEAD that is closest?
-         // For now, to be safe and concise, falling back to git describe or implementing a simple walk.
-         // Let's stick to git describe for the *logic* of "latest tag" as it's complex to replicate exactly.
-         match run_git(&["describe", "--tags", "--abbrev=0"]) {
+        // Find latest tag
+        // gix doesn't have a direct "describe --tags" equivalent built-in simply yet
+        // We can iterate tags and find the one reachable from HEAD that is closest?
+        // For now, to be safe and concise, falling back to git describe or implementing a simple walk.
+        // Let's stick to git describe for the *logic* of "latest tag" as it's complex to replicate exactly.
+        match run_git(&["describe", "--tags", "--abbrev=0"]) {
             Ok(tag) => {
-                 let tag_ref_name = format!("refs/tags/{}", tag);
-                 let tag_ref = repo.find_reference(&tag_ref_name)
+                let tag_ref_name = format!("refs/tags/{}", tag);
+                let tag_ref = repo
+                    .find_reference(&tag_ref_name)
                     .map_err(|_| anyhow!("Error resolving found tag {}", tag))?;
-                 tag_ref.into_fully_peeled_id().context("Failed to peel tag")?
-            },
+                tag_ref
+                    .into_fully_peeled_id()
+                    .context("Failed to peel tag")?
+            }
             Err(_) => {
                 debug("Error finding latest tag", args.debug_mode);
                 return Err(anyhow!("Error: No tags found in repository"));
@@ -175,12 +184,18 @@ async fn main() -> Result<()> {
         }
         commit_ids.push(oid);
     }
-    
+
     let commit_count = commit_ids.len();
-    debug(&format!("Found {} commits between {} and HEAD", commit_count, from_oid), args.debug_mode);
-    
+    debug(
+        &format!(
+            "Found {} commits between {} and HEAD",
+            commit_count, from_oid
+        ),
+        args.debug_mode,
+    );
+
     if commit_count == 0 {
-         debug("WARNING: No commits found", args.debug_mode);
+        debug("WARNING: No commits found", args.debug_mode);
     }
 
     if args.show_raw_commits {
@@ -193,7 +208,7 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    
+
     // Display ref name
     let display_ref = if let Some(t) = &args.tag {
         t.clone()
@@ -201,7 +216,7 @@ async fn main() -> Result<()> {
         c.clone()
     } else {
         // We resolved from describe
-         match run_git(&["describe", "--tags", "--abbrev=0"]) {
+        match run_git(&["describe", "--tags", "--abbrev=0"]) {
             Ok(t) => t,
             Err(_) => from_oid.to_string(),
         }
@@ -222,17 +237,27 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    
+
     // Remote URL
     let remote = repo.find_remote("origin").ok();
-    let remote_url = remote.and_then(|r| r.url(gix::remote::Direction::Fetch).map(|u| u.to_bstring().to_string()))
+    let remote_url = remote
+        .and_then(|r| {
+            r.url(gix::remote::Direction::Fetch)
+                .map(|u| u.to_bstring().to_string())
+        })
         .or_else(|| run_git(&["remote", "get-url", "origin"]).ok())
         .unwrap_or_default();
-        
+
     let repo_regex = Regex::new(r"github\.com[:/]([^/]+)/([^/\.]+)(\.git)?").unwrap();
     let (owner, repo_name) = if let Some(caps) = repo_regex.captures(&remote_url) {
-        (caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default(), 
-         caps.get(2).map(|m| m.as_str().to_string()).unwrap_or_default())
+        (
+            caps.get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default(),
+            caps.get(2)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default(),
+        )
     } else {
         (String::new(), String::new())
     };
@@ -243,14 +268,14 @@ async fn main() -> Result<()> {
     use std::collections::HashMap;
     let mut commit_to_pr: HashMap<gix::ObjectId, u64> = HashMap::new();
     let re_merge_pr = Regex::new(r"Merge pull request #([0-9]+)").unwrap();
-    
+
     // First, scan commits in our range for merge commits
     for oid in &commit_ids {
         let obj = repo.find_object(*oid)?;
         let commit = obj.into_commit();
         let msg = commit.message()?;
         let subject = msg.summary().to_string();
-        
+
         // Check if this is a merge commit with a PR number
         if let Some(caps) = re_merge_pr.captures(&subject) {
             if let Some(m) = caps.get(1) {
@@ -266,14 +291,14 @@ async fn main() -> Result<()> {
             }
         }
     }
-    
+
     // Also scan merge commits that are ancestors of commits in our range
     // This catches merge commits that might be just outside our range but still relevant
     let mut seen_commits = std::collections::HashSet::new();
     for oid in &commit_ids {
         seen_commits.insert(*oid);
     }
-    
+
     // Walk backwards from each commit to find merge commits
     // This helps find PR numbers for commits that were merged but the merge commit
     // might be outside our immediate range
@@ -293,7 +318,7 @@ async fn main() -> Result<()> {
             };
             let commit = obj.into_commit();
             let parents = commit.parent_ids().collect::<Vec<_>>();
-            
+
             // Check if any parent is a merge commit we haven't seen
             for parent_id in &parents {
                 let parent_oid: gix::ObjectId = (*parent_id).into();
@@ -301,7 +326,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 seen_commits.insert(parent_oid);
-                
+
                 let parent_obj = match repo.find_object(parent_oid) {
                     Ok(o) => o,
                     Err(_) => continue,
@@ -312,7 +337,7 @@ async fn main() -> Result<()> {
                     Err(_) => continue,
                 };
                 let parent_subject = parent_msg.summary().to_string();
-                
+
                 // Check if this parent is a merge commit with a PR number
                 if let Some(caps) = re_merge_pr.captures(&parent_subject) {
                     if let Some(m) = caps.get(1) {
@@ -327,7 +352,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            
+
             // Move to first parent for next iteration (if we haven't found a PR)
             if current.is_some() {
                 current = parents.first().map(|p| (*p).into());
@@ -348,11 +373,22 @@ async fn main() -> Result<()> {
         let body = msg.body().map(|b| b.to_string()).unwrap_or_default();
         let author = commit.author()?.name.to_string();
         let hash = oid.to_string();
-        
+
         // Check if we found a PR number for this commit from merge commits
         let pr_from_merge = commit_to_pr.get(&oid).copied();
 
-        let result = process_commit_with_pr(&subject, &body, &hash, &author, args.include_pr_numbers, pr_from_merge, &octocrab, &owner, &repo_name).await;
+        let result = process_commit_with_pr(
+            &subject,
+            &body,
+            &hash,
+            &author,
+            args.include_pr_numbers,
+            pr_from_merge,
+            &octocrab,
+            &owner,
+            &repo_name,
+        )
+        .await;
         if let Some(res) = result {
             match res {
                 ProcessedCommit::Dependabot(lines) => dependabot_updates.extend(lines),
@@ -363,18 +399,18 @@ async fn main() -> Result<()> {
 
     // Print output
     let full_output = generate_release_notes(dependabot_updates, other_changes);
-    
+
     if !full_output.is_empty() {
         println!("{}", full_output);
     }
-    
+
     if args.clipboard {
         match Clipboard::new() {
             Ok(mut clipboard) => {
                 if let Err(e) = clipboard.set_text(&full_output) {
-                     eprintln!("Failed to copy to clipboard: {}", e);
+                    eprintln!("Failed to copy to clipboard: {}", e);
                 }
-            },
+            }
             Err(e) => eprintln!("Failed to initialize clipboard: {}", e),
         }
     }
