@@ -43,6 +43,9 @@ pub async fn process_commit_with_pr(
     if subject
         .to_lowercase()
         .contains("setting new snapshot version")
+        || subject
+            .to_lowercase()
+            .contains("bump to next snapshot release")
     {
         return None;
     }
@@ -398,6 +401,22 @@ mod tests {
     async fn test_snapshot_version_ignored() {
         let res = process_commit(
             "Setting new snapshot version 1.0",
+            "",
+            "sha",
+            "User",
+            false,
+            &None,
+            "",
+            "",
+        )
+        .await;
+        assert_eq!(res, None);
+    }
+
+    #[tokio::test]
+    async fn test_bump_to_next_snapshot_release_ignored() {
+        let res = process_commit(
+            "Bump to next snapshot release",
             "",
             "sha",
             "User",
